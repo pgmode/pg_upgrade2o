@@ -1,6 +1,6 @@
 
 
-# `pg_upgrade2o` Script Documentation
+# `pg_upgrade2o` Documentation
 
 The `pg_upgrade2o` script is a flexible utility designed for managing PostgreSQL version upgrades with minimal manual intervention. It supports various upgrade modes (clone, copy, link) and can handle tasks such as promoting standby nodes, managing extensions, and conducting a full database analysis after upgrade using parallel vacuuming.
 
