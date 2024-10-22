@@ -1,0 +1,263 @@
+#!/bin/bash
+# Author: Sheikh Wasiu Al Hasib
+# Description: It is a optimized format of pg_upgrade version
+
+# Log file for summary report
+LOG_FILE="pg_upgrade_summary.log"
+
+# Display help menu if no arguments or invalid arguments are provided
+function display_help() {
+    echo "Usage: pg_upgrade_custom [command] [options]"
+    echo ""
+    echo "Commands:"
+    echo "  check                     - Check the upgrade status"
+    echo "  clone                     - Perform the upgrade process. You can also use for link and copy"
+    echo "  help                      - Display this help menu"
+    echo ""
+    echo "Options (required for 'clone' command):"
+    echo "  --old-path PATH           - Path to the old PostgreSQL data directory"
+    echo "  --new-path PATH           - Path to the new PostgreSQL data directory"
+    echo "  --old-bin-path PATH       - Path to the old PostgreSQL binaries"
+    echo "  --new-bin-path PATH       - Path to the new PostgreSQL binaries"
+    echo "  --old-port PORT           - Port for the old PostgreSQL instance"
+    echo "  --new-port PORT           - Port for the new PostgreSQL instance"
+    echo "  --pguser USERNAME         - PostgreSQL user"
+    echo "  --pg-old-version VERSION  - Old PostgreSQL version number (e.g., 13)"
+    echo "  --pg-new-version VERSION  - New PostgreSQL version number (e.g., 14)"
+    echo "  --extensions EXT1,EXT2    - Optional: Comma-separated list of extensions to drop before upgrade and recreate after upgrade"
+    echo "  --jobs JOBS               - Optional: Number of parallel jobs for vacuumdb; defaults to CPU core count"
+    echo ""
+    echo "Examples:"
+    echo "  pg_upgrade_custom check --old-path /path/to/old --new-path /path/to/new \\"
+    echo "                          --old-bin-path /old/bin --new-bin-path /new/bin \\"
+    echo "                          --old-port 5432 --new-port 5433 \\"
+    echo "                          --pguser postgres --pg-old-version 13 --pg-new-version 14 \\"
+    echo "                          --extensions hstore,pgcrypto --jobs 4"
+    echo "  pg_upgrade_custom clone --old-path /path/to/old --new-path /path/to/new \\"
+    echo "                          --old-bin-path /old/bin --new-bin-path /new/bin \\"
+    echo "                          --old-port 5432 --new-port 5433 \\"
+    echo "                          --pguser postgres --pg-old-version 13 --pg-new-version 14 \\"
+    echo "                          --extensions hstore,pgcrypto --jobs 4"
+    echo ""
+    exit 1
+}
+
+# Parse the command
+if [ -z "$1" ]; then
+    display_help
+elif [[ "$1" != "check" && "$1" != "clone" && "$1" != "help" ]]; then
+    echo "Invalid command: $1"
+    display_help
+elif [[ "$1" == "help" ]]; then
+    display_help
+fi
+
+execution=$1
+shift
+
+# Default value for JOBS is the number of CPU cores
+JOBS=$(nproc)
+
+# Parse options
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --old-path) OLD_PATH="$2"; shift ;;
+        --new-path) NEW_PATH="$2"; shift ;;
+        --old-bin-path) OLD_BIN_PATH="$2"; shift ;;
+        --new-bin-path) NEW_BIN_PATH="$2"; shift ;;
+        --old-port) OLD_PORT="$2"; shift ;;
+        --new-port) NEW_PORT="$2"; shift ;;
+        --pguser) PGUSER="$2"; shift ;;
+        --pg-old-version) PG_OLD_VERSION="$2"; shift ;;
+        --pg-new-version) PG_NEW_VERSION="$2"; shift ;;
+        --extensions) EXTENSIONS="$2"; shift ;;
+        --jobs) JOBS="$2"; shift ;;  # Override JOBS if specified
+        *) echo "Unknown option: $1"; display_help ;;
+    esac
+    shift
+done
+
+# Check required parameters for 'clone' command
+if [[ "$execution" == "clone" ]]; then
+    if [[ -z "$OLD_PATH" || -z "$NEW_PATH" || -z "$OLD_BIN_PATH" || -z "$NEW_BIN_PATH" || -z "$OLD_PORT" || -z "$NEW_PORT" || -z "$PGUSER" || -z "$PG_OLD_VERSION" || -z "$PG_NEW_VERSION" ]]; then
+        echo "Error: Missing required options for 'clone' command."
+        display_help
+    fi
+fi
+
+# Convert comma-separated extensions into an array if provided
+if [ -n "$EXTENSIONS" ]; then
+    IFS=',' read -ra EXTENSIONS_ARRAY <<< "$EXTENSIONS"
+fi
+
+# Validate that PG_OLD_VERSION and PG_NEW_VERSION are set
+if [[ -z "$PG_OLD_VERSION" || -z "$PG_NEW_VERSION" ]]; then
+    echo "Error: PostgreSQL versions (PG_OLD_VERSION and PG_NEW_VERSION) must be specified."
+    exit 1
+fi
+
+# Define paths for PostgreSQL configuration files
+postgres_conf_old="$OLD_PATH/postgresql.conf"
+postgres_conf_new="$NEW_PATH/postgresql.conf"
+
+# Check the status of the old and new PostgreSQL versions
+pg_old_status=$(/usr/pgsql-$PG_OLD_VERSION/bin/pg_ctl status -D "$OLD_PATH" | grep -i 'server is running' | wc -l)
+pg_new_status=$(/usr/pgsql-$PG_NEW_VERSION/bin/pg_ctl status -D "$NEW_PATH" | grep -i 'server is running' | wc -l)
+
+# Initialize timing variables
+start_time=$(date +%s)
+
+# Function to drop specified extensions from databases
+function _drop_extension() {
+    if [ -n "$EXTENSIONS" ]; then
+        PGCMD="psql -U $PGUSER -p $OLD_PORT -X"
+        DATABASES=$($PGCMD -Atc "SELECT datname FROM pg_database WHERE datname <> 'template0'")
+
+        for DB in $DATABASES; do
+            for ex in "${EXTENSIONS_ARRAY[@]}"; do
+                extension_exists=$(psql -p "$OLD_PORT" -d "$DB" -Axtc "SELECT extname FROM pg_extension WHERE extname = '$ex';" | wc -l)
+                if [ "$extension_exists" -gt 0 ]; then
+                    echo "Removing $ex extension from database: $DB"
+                    $PGCMD -d "$DB" -c "DROP EXTENSION IF EXISTS $ex;"
+                fi
+            done
+        done
+        echo "Specified extensions dropped."
+    fi
+}
+
+# Function to create specified extensions in databases
+function _create_extension() {
+    if [ -n "$EXTENSIONS" ]; then
+        PGCMD="psql -U $PGUSER -p $NEW_PORT -X"
+        DATABASES=$($PGCMD -Atc "SELECT datname FROM pg_database WHERE datname <> 'template0';")
+
+        for DB in $DATABASES; do
+            echo "Creating extensions in database: $DB"
+            for ex in "${EXTENSIONS_ARRAY[@]}"; do
+                $PGCMD -d "$DB" -c "CREATE EXTENSION IF NOT EXISTS $ex;"
+            done
+        done
+        echo "Specified extensions created in all databases."
+    fi
+}
+
+# Function to stop PostgreSQL instances
+function _pg_stop() {
+    if [ "$pg_new_status" -gt 0 ]; then
+        echo "Stopping PostgreSQL $PG_NEW_VERSION..."
+        /usr/pgsql-$PG_NEW_VERSION/bin/pg_ctl stop -D "$NEW_PATH"
+    fi
+
+    if [ "$pg_old_status" -gt 0 ]; then
+        echo "Stopping PostgreSQL $PG_OLD_VERSION..."
+        /usr/pgsql-$PG_OLD_VERSION/bin/pg_ctl stop -D "$OLD_PATH"
+    fi
+}
+
+# Function to promote the old PostgreSQL instance if in recovery mode
+function _pg_old_promote() {
+    if [ "$pg_old_status" -gt 0 ]; then
+        pg_is_in_recovery=$(psql -p $OLD_PORT -U $PGUSER -Axtc "SELECT pg_is_in_recovery()" | cut -d '|' -f2)
+        if [ "$pg_is_in_recovery" == "t" ]; then
+            echo "Promoting PostgreSQL $PG_OLD_VERSION..."
+            /usr/pgsql-$PG_OLD_VERSION/bin/pg_ctl promote -D "$OLD_PATH"
+            _drop_extension
+        fi
+
+        if [ $? -eq 0 ]; then
+            _pg_stop
+        fi
+    fi
+}
+
+# Function to perform PostgreSQL upgrade
+function _pg_upgrade() {
+    echo "Starting upgrade: $execution..."
+
+    /usr/pgsql-$PG_NEW_VERSION/bin/pg_upgrade \
+        --old-datadir="$OLD_PATH" \
+        --new-datadir="$NEW_PATH" \
+        --old-bindir="$OLD_BIN_PATH" \
+        --new-bindir="$NEW_BIN_PATH" \
+        --old-options "-c config_file=$postgres_conf_old" \
+        --new-options "-c config_file=$postgres_conf_new" \
+        --$execution
+
+    if [ $? -eq 0 ]; then
+        if [[ "$execution" == "clone" ||  "$execution" == "link" ||  "$execution" == "copy" ]]; then
+            echo "Starting $execution for PostgreSQL $PG_NEW_VERSION..."
+            echo "port = $NEW_PORT" >> "$NEW_PATH/postgresql.conf"
+            /usr/pgsql-$PG_NEW_VERSION/bin/pg_ctl start -D "$NEW_PATH"
+
+            if [ $? -eq 0 ]; then
+                before_vacuum_time=$(date +%s)
+                /usr/pgsql-$PG_NEW_VERSION/bin/vacuumdb --all --analyze-in-stages -p $NEW_PORT -j $JOBS
+                vacuum_end_time=$(date +%s)
+
+                _create_extension
+            fi
+
+            if [ -e update_extensions.sql ]; then
+                echo "Updating extensions..."
+                psql -p $NEW_PORT -U $PGUSER -f update_extensions.sql
+            fi
+
+            if [ $? -eq 0 ]; then
+                echo "Upgrade completed: $(date)"
+            fi
+        else
+            echo "Upgrade mode is not set to 'clone/copy/link'."
+        fi
+    else
+        echo "Error during upgrade, please check the logs."
+    fi
+}
+
+# Warning messages for 'clone' command
+if [[ "$execution" == "clone" ||  "$execution" == "link" ||  "$execution" == "copy" ]]; then
+    echo " "
+    echo  "************************************** WARNING NOTES **********************************************************"
+    echo " "
+
+    echo "Warning: You are about to perform a database upgrade with the following actions:"
+    echo "1) This process will promote the standby to primary."
+    echo "2) All extensions specified (if any) will be dropped from the old version and recreated in the new version."
+    echo "3) The upgrade will proceed from the lower version ($PG_OLD_VERSION) to the upper version ($PG_NEW_VERSION)."
+
+    echo " "
+    echo  "***************************************************************************************************************"
+    echo " "
+    echo ""
+    read -p "Do you want to continue? (y/n): " confirm
+    if [ "$confirm" != "y" ]; then
+        echo "Upgrade canceled."
+        exit 0
+    fi
+    # Run the promotion function only if 'clone' command is executed
+    _pg_old_promote
+fi
+
+# Main script execution
+_pg_upgrade "$execution"
+
+# Timing summary report
+end_time=$(date +%s)
+
+# Calculate elapsed times
+total_time=$((end_time - start_time))
+pre_vacuum_time=$((before_vacuum_time - start_time))
+vacuum_time=$((vacuum_end_time - before_vacuum_time))
+
+# Write summary to log file
+echo " " > $LOG_FILE
+echo "******************************* SUMMARY REPORT ********************************" >> $LOG_FILE
+echo "Total time for entire upgrade process: $((total_time / 60)) minutes and $((total_time % 60)) seconds" >> $LOG_FILE
+echo "Time taken before vacuum operation: $((pre_vacuum_time / 60)) minutes and $((pre_vacuum_time % 60)) seconds" >> $LOG_FILE
+echo "Time taken for vacuum operation: $((vacuum_time / 60)) minutes and $((vacuum_time % 60)) seconds" >> $LOG_FILE
+echo "*******************************************************************************" >> $LOG_FILE
+echo " "
+
+# Output log location
+echo "Summary report has been saved to $LOG_FILE"
+
