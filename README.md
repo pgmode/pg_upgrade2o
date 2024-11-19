@@ -44,7 +44,10 @@ pg_upgrade2o [command] [options]
 1. **Checking Upgrade Status**
 
    ```bash
-   pg_upgrade2o check
+      pg_upgrade2o check --old-path /var/lib/pgsql/old --new-path /var/lib/pgsql/new \
+                          --old-bin-path /usr/pgsql-13/bin --new-bin-path /usr/pgsql-14/bin \
+                          --old-port 5432 --new-port 5433 \
+                          --pguser postgres --pg-old-version 13 --pg-new-version 14
    ```
 
 2. **Performing a Clone Upgrade with Extension Management**
@@ -123,4 +126,4 @@ Time taken for vacuum operation: 3 minutes and 20 seconds
 - **Parallel Vacuuming**: The `--jobs` option can be set to manage the level of parallelism for `vacuumdb` in systems with multiple CPU cores. If not specified, it defaults to the full core count.
 - **Log File**: `pg_upgrade_summary.log` provides a summary of the time taken for each critical phase during an upgrade, offering a performance overview for clone, copy, and link operations.
 
-This documentation covers the essential features and usage of the `pg_upgrade2o` script, making it easier to execute and monitor PostgreSQL upgrades efficiently.
+This documentation covers the essential features and usage of the `pg_upgrade2o` script, making it easier to execute and monitor PostgreSQL upgrades efficiently. It will continusly update  to make upgrade more flexible.
